@@ -130,6 +130,8 @@ param(
 
 # The one-line form (iex) cannot pass parameters, so every option also reads an env var.
 if (-not $EnvFile -and $env:COFOUNDER_ENV_FILE) { $EnvFile = $env:COFOUNDER_ENV_FILE }
+# Absolute from here on: Test-Path follows PowerShell's location, [IO.File] the process cwd.
+if ($EnvFile) { $EnvFile = (Resolve-Path -LiteralPath $EnvFile -ErrorAction Stop).ProviderPath }
 if ($env:COFOUNDER_SSH_PUBLIC_KEY) { $SshPublicKey = $env:COFOUNDER_SSH_PUBLIC_KEY }
 if (-not $TailscaleAuthKey -and $env:COFOUNDER_TAILSCALE_AUTHKEY) { $TailscaleAuthKey = $env:COFOUNDER_TAILSCALE_AUTHKEY }
 if (-not $HeartbeatUrl -and $env:COFOUNDER_HEARTBEAT_URL) { $HeartbeatUrl = $env:COFOUNDER_HEARTBEAT_URL }
@@ -179,6 +181,13 @@ function Refresh-Path {
               [Environment]::GetEnvironmentVariable('Path', 'User')
 }
 
+# Secret-looking arguments (--auth-key=..., --token=...) never reach a failure message.
+function Hide-SecretArgs([string[]]$ArgumentList) {
+  foreach ($a in $ArgumentList) {
+    if ($a -match '^(--?(auth-?key|token|password|secret)=).+$') { $Matches[1] + '***' } else { $a }
+  }
+}
+
 # Runs a native command, streams its output to the console, throws on a bad exit code.
 function Invoke-Native([string]$File, [string[]]$ArgumentList, [string]$WorkingDirectory = '', [int[]]$OkExitCodes = @(0)) {
   $prev = $ErrorActionPreference
@@ -192,7 +201,7 @@ function Invoke-Native([string]$File, [string[]]$ArgumentList, [string]$WorkingD
     if ($pushed) { Pop-Location }
     $ErrorActionPreference = $prev
   }
-  if ($OkExitCodes -notcontains $code) { throw "$File $($ArgumentList -join ' ') exited with $code" }
+  if ($OkExitCodes -notcontains $code) { throw "$File $(@(Hide-SecretArgs $ArgumentList) -join ' ') exited with $code" }
 }
 
 # Runs a native command quietly and returns @{ Output; ExitCode }.
@@ -215,10 +224,27 @@ function Set-RegistryValue([string]$Path, [string]$Name, $Value, [string]$Type =
   New-ItemProperty -Path $Path -Name $Name -Value $Value -PropertyType $Type -Force | Out-Null
 }
 
-function Install-WingetPackage([string]$Id, [string]$Name) {
-  $listed = Invoke-Capture 'winget' @('list', '--id', $Id, '--exact', '--accept-source-agreements')
+# winget is an App Execution Alias; in a key-authenticated SSH session the alias can fail to
+# launch while Get-Command still finds it. Resolve the real binary from the App Installer
+# package first, fall back to the alias, and throw (inside a step, so the run goes on and the
+# access step is never skipped) when neither exists: App Installer comes from the Store.
+function Get-WingetExe {
+  try {
+    $pkg = Get-AppxPackage Microsoft.DesktopAppInstaller -ErrorAction Stop | Select-Object -First 1
+    if ($pkg) { $exe = Join-Path $pkg.InstallLocation 'winget.exe'; if (Test-Path $exe) { return $exe } }
+  } catch { }
+  $cmd = Get-Command winget -ErrorAction SilentlyContinue
+  if ($cmd) { return $cmd.Source }
+  throw 'winget is missing. Install "App Installer" from the Microsoft Store, then re-run.'
+}
+
+# $Present: true when the tool is already on the box; then winget is not touched at all.
+function Install-WingetPackage([string]$Id, [string]$Name, [scriptblock]$Present = $null) {
+  if ($Present -and (& $Present)) { Skip "$Name already installed"; Refresh-Path; return }
+  $winget = Get-WingetExe
+  $listed = Invoke-Capture $winget @('list', '--id', $Id, '--exact', '--accept-source-agreements')
   if ($listed.Output -match [regex]::Escape($Id)) { Skip "$Name already installed"; Refresh-Path; return }
-  $r = Invoke-Capture 'winget' @('install', '--id', $Id, '--exact', '--silent',
+  $r = Invoke-Capture $winget @('install', '--id', $Id, '--exact', '--silent',
     '--accept-package-agreements', '--accept-source-agreements', '--disable-interactivity')
   # -1978335189 = APPINSTALLER_CLI_ERROR_PACKAGE_ALREADY_INSTALLED
   if ($r.ExitCode -ne 0 -and $r.ExitCode -ne -1978335189) { throw "winget install $Id exited with $($r.ExitCode): $($r.Output)" }
@@ -303,16 +329,24 @@ function Get-TailnetSelf {
 # run, and right after the system step in the access-only run.
 function Invoke-TailnetStep {
   Invoke-Step 'Access: Tailscale' {
-    Install-WingetPackage 'Tailscale.Tailscale' 'Tailscale'
     $ts = Join-Path $env:ProgramFiles 'Tailscale\tailscale.exe'
+    Install-WingetPackage 'Tailscale.Tailscale' 'Tailscale' { Test-Path $ts }
     if (-not (Test-Path $ts)) { throw "tailscale.exe not found at $ts" }
     $hn = $env:COMPUTERNAME.ToLower()
     if ($ComputerName) { $hn = $ComputerName.ToLower() }
     $self = Get-TailnetSelf
     if ($self.State -eq 'Running') { Skip "already on the tailnet as $($self.DnsName)" }
     elseif ($TailscaleAuthKey) {
-      Invoke-Native $ts @('up', "--auth-key=$TailscaleAuthKey", "--hostname=$hn", '--accept-dns=true', '--timeout=5m')
-      Done 'joined the tailnet with the auth key'
+      # The key goes through a temp file (`--auth-key=file:...`), never through the argument
+      # list, so neither a process listing nor a failure message can show it.
+      $keyFile = Join-Path $env:TEMP ('ts-authkey-' + [guid]::NewGuid().ToString('N'))
+      Write-Utf8NoBom $keyFile $TailscaleAuthKey
+      try {
+        Invoke-Native $ts @('up', "--auth-key=file:$keyFile", "--hostname=$hn", '--accept-dns=true', '--timeout=5m')
+        Done 'joined the tailnet with the auth key'
+      } catch {
+        throw 'tailscale up with the auth key failed; check the key (expiry, reusable, tags) at login.tailscale.com/admin/settings/keys'
+      } finally { Remove-Item $keyFile -Force -ErrorAction SilentlyContinue }
     } else {
       # No key: `tailscale up` prints a login URL and waits. Open it from ANY device signed in
       # to the Tailscale account (this PC, your phone, the laptop); it authorises this node.
@@ -365,8 +399,8 @@ function Write-Summary {
 $EnvTemplate = @'
 # CoFounder worker --- production env for this box. Never commit it (.gitignore covers .env).
 # Every value comes from the Vercel "api" project (Settings -> Environment Variables); it is the
-# same list docs/deploy-fly.md step 2 sets on the Fly machine. Any REPLACE_ME left in this
-# file stops the service from being started by the provisioning script.
+# same list docs/deploy-fly.md step 2 sets on the Fly machine. The provisioning script refuses
+# to start the service while any VALUE below still holds the placeholder it was written with.
 
 NODE_ENV=production
 DEMO_MODE=false
@@ -409,11 +443,10 @@ $identity = [Security.Principal.WindowsPrincipal][Security.Principal.WindowsIden
 if (-not $identity.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
   throw 'Run this from an elevated PowerShell (right-click -> Run as administrator).'
 }
-if (-not (Get-Command winget -ErrorAction SilentlyContinue)) {
-  throw 'winget is missing. Install "App Installer" from the Microsoft Store, then re-run.'
-}
 $os = Get-CimInstance Win32_OperatingSystem
-$isHome = $os.Caption -match 'Home'
+# Home editions by SKU / EditionID, never by caption: the caption is localised ("Famille").
+$isHome = ([int]$os.OperatingSystemSKU -in 98, 99, 100, 101) -or
+  (((Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion' -ErrorAction SilentlyContinue).EditionID) -match '^Core')
 Write-Host "   $($os.Caption), PowerShell $($PSVersionTable.PSVersion), user $env:USERNAME"
 foreach ($d in @($InstallRoot, $LogDir, $ToolsDir, $TmpDir)) { New-Item -ItemType Directory -Path $d -Force | Out-Null }
 Done "layout under $InstallRoot"
@@ -467,7 +500,11 @@ Invoke-Step 'Access: OpenSSH Server' {
 # ------ 2. system ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
 
 Invoke-Step 'System: scripts, long paths, power, updates, time' {
-  Set-ExecutionPolicy RemoteSigned -Scope LocalMachine -Force
+  # The policy IS set even when PowerShell reports that a more specific scope (the -ExecutionPolicy
+  # Bypass this console may run under) overrides it; under Stop that report is a terminating
+  # error, and it would take sleep/hibernate/update/time below down with it. Swallow only that.
+  try { Set-ExecutionPolicy RemoteSigned -Scope LocalMachine -Force -ErrorAction Stop }
+  catch { if ($_.FullyQualifiedErrorId -notlike 'ExecutionPolicyOverride*') { throw } }
   Set-RegistryValue 'HKLM:\SYSTEM\CurrentControlSet\Control\FileSystem' 'LongPathsEnabled' 1
   Done 'RemoteSigned execution policy, long paths enabled'
 
@@ -523,7 +560,7 @@ if ($AccessOnly) {
 # ------ 3. tooling ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
 
 Invoke-Step 'Tooling: Git, Node, corepack' {
-  Install-WingetPackage 'Git.Git' 'Git for Windows'
+  Install-WingetPackage 'Git.Git' 'Git for Windows' { [bool](Get-Command git -ErrorAction SilentlyContinue) }
   Invoke-Native 'git' @('config', '--global', 'core.longpaths', 'true')
   Invoke-Native 'git' @('config', '--global', 'core.autocrlf', 'true')   # what the laptop checkout uses
   Install-Node $NodeMajor
@@ -534,17 +571,22 @@ Invoke-Step 'Tooling: Git, Node, corepack' {
 # ------ 4. repo ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
 
 Invoke-Step 'Repo: GitHub auth and clone' {
-  Install-WingetPackage 'GitHub.cli' 'GitHub CLI'
+  Install-WingetPackage 'GitHub.cli' 'GitHub CLI' { [bool](Get-Command gh -ErrorAction SilentlyContinue) }
   $status = Invoke-Capture 'gh' @('auth', 'status', '--hostname', 'github.com')
   if ($status.ExitCode -ne 0) {
+    # --insecure-storage: the token lives in gh's hosts.yml under this profile instead of the
+    # Windows Credential Manager, which a key-authenticated SSH logon cannot unlock -- and every
+    # later update-worker.ps1 run over SSH needs it for git pull.
     if ($GitHubToken) {
       $tokenFile = Join-Path $env:TEMP ('gh-token-' + [guid]::NewGuid().ToString('N'))
       Write-Utf8NoBom $tokenFile $GitHubToken
-      try { Invoke-Native 'cmd.exe' @('/c', "gh auth login --hostname github.com --with-token < `"$tokenFile`"") }
+      try { Invoke-Native 'cmd.exe' @('/c', "gh auth login --hostname github.com --insecure-storage --with-token < `"$tokenFile`"") }
       finally { Remove-Item $tokenFile -Force -ErrorAction SilentlyContinue }
+    } elseif ($env:SSH_CONNECTION) {
+      throw 'gh cannot prompt inside an SSH session: re-run with COFOUNDER_GITHUB_TOKEN (a fine-grained token with read access to the repo), or run this script once at the console'
     } else {
       Write-Host '   GitHub login (a browser window / device code follows):'
-      Invoke-Native 'gh' @('auth', 'login', '--hostname', 'github.com', '--git-protocol', 'https', '--web')
+      Invoke-Native 'gh' @('auth', 'login', '--hostname', 'github.com', '--git-protocol', 'https', '--web', '--insecure-storage')
     }
   } else { Skip 'gh already logged in' }
   Invoke-Native 'gh' @('auth', 'setup-git')
@@ -631,6 +673,9 @@ Invoke-Step "Service: $ServiceName via NSSM" {
   $nssm = Install-Nssm
   $nodeExe = (Get-Command node).Source
   $workerDir = Join-Path $RepoDir 'apps\worker'   # cwd matters: main.ts loads ../../.env from here
+  if (-not (Test-Path (Join-Path $workerDir 'dist\main.js'))) {
+    throw 'apps\worker\dist\main.js is missing (the build step failed): the service is not registered, so a reboot cannot launch a broken worker'
+  }
 
   if (Get-Service -Name $ServiceName -ErrorAction SilentlyContinue) {
     Invoke-Capture $nssm @('stop', $ServiceName) | Out-Null
@@ -644,7 +689,6 @@ Invoke-Step "Service: $ServiceName via NSSM" {
   Set-NssmValue $nssm 'AppDirectory' @($workerDir)
   Set-NssmValue $nssm 'DisplayName' @('CoFounder worker')
   Set-NssmValue $nssm 'Description' @("CoFounder BullMQ worker, roles $WorkerRoles. Log: $WorkerLog")
-  Set-NssmValue $nssm 'Start' @('SERVICE_DELAYED_AUTO_START')
   Set-NssmValue $nssm 'AppEnvironmentExtra' @('NODE_ENV=production')
   Set-NssmValue $nssm 'AppStdout' @($WorkerLog)
   Set-NssmValue $nssm 'AppStderr' @($WorkerLog)
@@ -662,9 +706,16 @@ Invoke-Step "Service: $ServiceName via NSSM" {
   Done "service configured (node $nodeExe, cwd $workerDir)"
 
   $envText = Get-Content -LiteralPath $EnvPath -Raw
-  if ($NoStart) { Pending "service left stopped (-NoStart). Start-Service $ServiceName when the Fly machine / laptop worker is off" }
-  elseif ($envText -match 'REPLACE_ME') { Pending 'service left stopped: .env still has REPLACE_ME values' }
-  else {
+  # Values only: the template's comments must never trip this gate.
+  $placeholders = [bool]($envText -match '(?m)^\s*[A-Za-z0-9_]+\s*=.*REPLACE_ME')
+  if ($NoStart -or $placeholders) {
+    # Manual start only: a reboot must not launch a worker with placeholder secrets, nor a second
+    # consumer of the queue while the Fly machine / laptop worker still owns it.
+    Set-NssmValue $nssm 'Start' @('SERVICE_DEMAND_START')
+    if ($NoStart) { Pending "service left stopped (-NoStart). Start-Service $ServiceName when the Fly machine / laptop worker is off, then re-run this script so it starts at boot" }
+    else { Pending 'service left stopped: .env still has placeholder values; fill them in and re-run this script' }
+  } else {
+    Set-NssmValue $nssm 'Start' @('SERVICE_DELAYED_AUTO_START')
     Start-Service -Name $ServiceName
     $ready = $false
     for ($i = 0; $i -lt 30 -and -not $ready; $i++) {
@@ -750,14 +801,26 @@ Invoke-Step 'Tools: update-worker.ps1' {
   $upd = Join-Path $ToolsDir 'update-worker.ps1'
   $body = @"
 # Pull the current branch, rebuild the worker, restart the service, show the tail of the log.
+# Native commands run through Run: under ErrorAction Stop, git's ordinary stderr ("From
+# https://...") becomes a terminating error when stderr is redirected (as it is over ssh), and a
+# non-zero pnpm exit would NOT stop the script, so a failed build would restart a stale dist.
 `$ErrorActionPreference = 'Stop'
 `$env:COREPACK_ENABLE_DOWNLOAD_PROMPT = '0'
+function Run([string]`$File, [string[]]`$ArgumentList) {
+  `$prev = `$ErrorActionPreference
+  `$ErrorActionPreference = 'Continue'
+  try { & `$File @ArgumentList 2>&1 | ForEach-Object { "`$_" }; `$code = `$LASTEXITCODE }
+  finally { `$ErrorActionPreference = `$prev }
+  if (`$code -ne 0) { throw "`$File `$(`$ArgumentList -join ' ') exited with `$code" }
+}
 Set-Location '$RepoDir'
-if ((git status --porcelain | Out-String).Trim()) { throw 'repo has local changes; commit or stash them first' }
-git pull --ff-only
-pnpm install --frozen-lockfile
-pnpm --filter @vra/adapters db:generate
-pnpm --filter @vra/worker build
+`$dirty = (Run 'git' @('status', '--porcelain') | Out-String).Trim()
+if (`$dirty) { throw 'repo has local changes; commit or stash them first' }
+Run 'git' @('pull', '--ff-only')
+Run 'pnpm' @('install', '--frozen-lockfile')
+Run 'pnpm' @('--filter', '@vra/adapters', 'db:generate')
+Run 'pnpm' @('--filter', '@vra/worker', 'build')
+if (-not (Test-Path 'apps\worker\dist\main.js')) { throw 'apps\worker\dist\main.js missing after build; service not restarted' }
 Restart-Service -Name '$ServiceName'
 Start-Sleep -Seconds 10
 Get-Content '$WorkerLog' -Tail 20

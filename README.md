@@ -68,10 +68,12 @@ scp C:\path\to\.env.cloud cofounder-srv:C:\srv\cofounder\.env.cloud
 ssh cofounder-srv "`$env:COFOUNDER_ENV_FILE='C:\srv\cofounder\.env.cloud'; [Net.ServicePointManager]::SecurityProtocol='Tls12'; iex (irm https://raw.githubusercontent.com/yassinebaazi99/cofounder-bootstrap/main/provision-windows-server.ps1)"
 ```
 
-The private application repo needs a GitHub login on the box. Over SSH there is no browser, so
-either run `gh auth login --web` once at the PC, or set `COFOUNDER_GITHUB_TOKEN` on that line to a
-fine-grained token with read access to the repo (it lands in the remote shell's history; prefer
-the one-time web login).
+The private application repo needs a GitHub login on the box, and `gh` cannot prompt inside an
+SSH session, so the script refuses there unless `COFOUNDER_GITHUB_TOKEN` is set to a fine-grained
+token with read access to the repo. The alternative is to run the full script once at the PC
+console instead: its browser login stores the token with `--insecure-storage` (gh's hosts.yml
+under the profile, not the Credential Manager, which a key-authenticated SSH logon cannot read),
+so every later `update-worker.ps1` over SSH can still pull.
 
 Every step is idempotent: run the script again after a reboot, after changing `.env`, or with
 different options. It refuses to start the service while `.env` still has `REPLACE_ME` markers.

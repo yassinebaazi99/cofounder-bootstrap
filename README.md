@@ -1,10 +1,10 @@
 # cofounder-bootstrap
 
 One PowerShell script that turns a fresh Windows 10/11 PC into the always-on CoFounder server:
-the BullMQ worker as a Windows service, remote access over Tailscale + OpenSSH (+ Remote Desktop
-on Pro), a heartbeat, power and update settings that keep it up, and Claude Code + GitHub CLI so
-the box can run agents. The script holds no secrets; the private application repo is cloned by
-the script after `gh auth login`.
+the BullMQ worker as a Windows service, remote access over OpenSSH + Tailscale (+ Remote Desktop
+on Pro), a heartbeat, and power and update settings that keep it up. Nothing of Claude is installed
+on the box: the laptop's Claude Code session drives it over SSH. The script holds no secrets; the
+private application repo is cloned by the script after `gh auth login`.
 
 ## Run it on the new PC
 
@@ -34,22 +34,23 @@ To pin a reviewed version instead of `main`, replace `main` in the URL with a co
 ## After it runs
 
 1. Join the tailnet if you did not pass an auth key: `& "C:\Program Files\Tailscale\tailscale.exe" up`
-2. Log Claude Code in once: `cd C:\srv\cofounder\repo; claude`
-3. Watch the worker: `Get-Content C:\srv\cofounder\logs\worker.log -Tail 50 -Wait`
+2. Watch the worker: `Get-Content C:\srv\cofounder\logs\worker.log -Tail 50 -Wait`
    The proof is `Processing agent run` followed by `Agent run finished`, not `Worker ready`.
-4. Then stop the Fly machine and the laptop worker. One owner of the agent queue.
+3. Then stop the Fly machine and the laptop worker. One owner of the agent queue.
 
-## Reach it from anywhere
+## Let the laptop's Claude session drive it over SSH
 
-Install Tailscale on the laptop (`winget install Tailscale.Tailscale`), log in to the same
-tailnet, then:
+Pass the laptop's public key as `-SshPublicKey` when you run the script; it lands in
+`administrators_authorized_keys`. The script prints the exact `ssh <user>@<host>` line at the
+end. Paste that line to Claude on the laptop.
 
-```powershell
-ssh <windows-user>@cofounder-srv
-```
+- Same Wi-Fi / LAN: works at once, port 22 is open to the local subnet.
+- From anywhere else: install Tailscale on the laptop too (`winget install Tailscale.Tailscale`),
+  log both machines into the same tailnet, and the same `ssh` line works over the tailnet name.
 
-Remote Desktop (Pro only, `-EnableRdp`) works over the same tailnet address, and a Claude Code
-session started inside a Remote Desktop session survives disconnects.
+The remote shell is PowerShell, so Claude runs `Get-Service`, `Get-Content -Tail`, the update
+script and anything else the way it would locally. Remote Desktop (Pro only, `-EnableRdp`) is
+there for you, not for Claude. Claude Code goes on the box only if you pass `-InstallClaude`.
 
 ## Update after a push to main
 

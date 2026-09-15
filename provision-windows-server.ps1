@@ -19,8 +19,8 @@
     access   - OpenSSH Server (PowerShell as the shell), Tailscale, optional Remote Desktop,
                inbound allowed only from the tailnet and the local subnet
     watch    - a heartbeat task that pings healthchecks.io every minute WHILE the service runs
-    agents   - Claude Code (native installer) + Git Bash path, so `claude` in the repo can
-               spawn the fleet; optional copy of a ~/.claude folder (never its credentials)
+    agents   - only with -InstallClaude: Claude Code on the box. By default nothing of Claude is
+               installed here; the laptop's Claude Code session drives the box over SSH
     tools    - <InstallRoot>\tools\update-worker.ps1 for pull -> build -> restart
 
   The script never prints a secret. Nothing here touches the database.
@@ -57,8 +57,9 @@
   A healthchecks.io (or compatible) ping URL. Optional.
 .PARAMETER EnableRdp
   Enable Remote Desktop (Pro/Enterprise only), scoped to tailnet + LAN.
-.PARAMETER SkipClaude
-  Do not install Claude Code / GitHub CLI.
+.PARAMETER InstallClaude
+  Also install Claude Code on the box. Off by default: the box is driven over SSH from the
+  laptop, where Claude Code already runs.
 .PARAMETER ClaudeUserDirFrom
   A copied ~/.claude folder; settings.json, CLAUDE.md, skills, agents,
   commands are copied, .credentials.json never is.
@@ -82,7 +83,7 @@ param(
   [string]$SshPublicKey = '',
   [string]$HeartbeatUrl = '',
   [switch]$EnableRdp,
-  [switch]$SkipClaude,
+  [switch]$InstallClaude,
   [string]$ClaudeUserDirFrom = '',
   [string]$GitHubToken = '',
   [switch]$NoStart
@@ -570,7 +571,7 @@ if (`$svc -and `$svc.Status -eq 'Running') {
 # ------ 10. agents ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
 
 Invoke-Step 'Agents: Claude Code' {
-  if ($SkipClaude) { Skip 'not requested'; return }
+  if (-not $InstallClaude) { Skip 'not requested (-InstallClaude): the box is driven over SSH from the laptop'; return }
   $bash = Join-Path $env:ProgramFiles 'Git\bin\bash.exe'
   if (Test-Path $bash) { [Environment]::SetEnvironmentVariable('CLAUDE_CODE_GIT_BASH_PATH', $bash, 'Machine') }
   if (Get-Command claude -ErrorAction SilentlyContinue) { Skip 'Claude Code already installed' }

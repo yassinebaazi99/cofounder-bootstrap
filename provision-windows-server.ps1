@@ -3,9 +3,34 @@
   Turn a fresh Windows 10/11 PC into the always-on CoFounder server.
 
 .DESCRIPTION
-  One elevated run does all of it, and every step is idempotent, so run it again after filling
-  in .env, after a reboot, or with different parameters:
+  One elevated run does all of it. The one-line form runs straight from memory, so there is no
+  downloaded file for PowerShell's execution policy to refuse:
 
+    [Net.ServicePointManager]::SecurityProtocol = 'Tls12'
+    iex (irm https://raw.githubusercontent.com/yassinebaazi99/cofounder-bootstrap/main/provision-windows-server.ps1)
+
+  Options for that form are environment variables set on the line before (COFOUNDER_ENV_FILE,
+  COFOUNDER_SSH_PUBLIC_KEY, COFOUNDER_TAILSCALE_AUTHKEY, COFOUNDER_HEARTBEAT_URL,
+  COFOUNDER_COMPUTER_NAME, COFOUNDER_GITHUB_TOKEN, COFOUNDER_WORKER_ROLES, and the flags
+  COFOUNDER_ACCESS_ONLY=1, COFOUNDER_ENABLE_RDP=1, COFOUNDER_INSTALL_CLAUDE=1,
+  COFOUNDER_NO_START=1). The parameters below are the same options for the file form. Every
+  step is idempotent: run it again after a reboot, after filling in .env, or with different
+  options.
+
+  THE TWO-MINUTE FORM (-AccessOnly / COFOUNDER_ACCESS_ONLY=1) runs only the access, system and
+  tailnet steps below and stops: the PC becomes reachable over SSH from anywhere, never sleeps,
+  and prints the USER and tailnet NAME the laptop needs. Everything else (tooling, repo, env,
+  build, service) is then done from the laptop over SSH, which is the point: the box is a VPS
+  you happen to own.
+
+    $env:COFOUNDER_ACCESS_ONLY = '1'
+    [Net.ServicePointManager]::SecurityProtocol = 'Tls12'
+    iex (irm https://raw.githubusercontent.com/yassinebaazi99/cofounder-bootstrap/main/provision-windows-server.ps1)
+
+    access   - FIRST: OpenSSH Server with PowerShell as the shell, port 22 open to the LAN and
+               the tailnet only, the laptop's public key authorised, and the USER / HOST / IP the
+               laptop needs printed. From here on the laptop's Claude session can drive the box
+               over SSH even if a later step stalls.
     system   - execution policy, long paths, never sleep, no fast startup, NIC power saving off,
                Windows Update pinned to Sunday 04:00, time sync, optional rename
     tooling  - Git, GitHub CLI, Node <NodeMajor> (official MSI, latest patch), pnpm via corepack
@@ -16,8 +41,8 @@
     build    - pnpm install --frozen-lockfile, prisma generate, tsup build of apps/worker
     service  - "CoFounderWorker" Windows service via NSSM: starts at boot with nobody logged
                in, restarts on crash, 300 s graceful stop (Fly's kill_timeout), rotating logs
-    access   - OpenSSH Server (PowerShell as the shell), Tailscale, optional Remote Desktop,
-               inbound allowed only from the tailnet and the local subnet
+    tailnet  - Tailscale (auth key or a browser login), optional Remote Desktop, both scoped to
+               the tailnet and the local subnet
     watch    - a heartbeat task that pings healthchecks.io every minute WHILE the service runs
     agents   - only with -InstallClaude: Claude Code on the box. By default nothing of Claude is
                installed here; the laptop's Claude Code session drives the box over SSH
@@ -26,13 +51,22 @@
   The script never prints a secret. Nothing here touches the database.
 
 .EXAMPLE
+  # one line, everything, defaults (elevated PowerShell on the new PC)
+  [Net.ServicePointManager]::SecurityProtocol = 'Tls12'; iex (irm https://raw.githubusercontent.com/yassinebaazi99/cofounder-bootstrap/main/provision-windows-server.ps1)
+
+.EXAMPLE
+  # one line with options
+  $env:COFOUNDER_ENV_FILE = 'D:\.env.cloud'; $env:COFOUNDER_ENABLE_RDP = '1'; $env:COFOUNDER_COMPUTER_NAME = 'cofounder-srv'
+  [Net.ServicePointManager]::SecurityProtocol = 'Tls12'; iex (irm https://raw.githubusercontent.com/yassinebaazi99/cofounder-bootstrap/main/provision-windows-server.ps1)
+
+.EXAMPLE
+  # file form
   powershell -ExecutionPolicy Bypass -File .\provision-windows-server.ps1 `
     -EnvFile D:\usb\.env -TailscaleAuthKey tskey-auth-xxxx -HeartbeatUrl https://hc-ping.com/<uuid> `
-    -SshPublicKey "ssh-ed25519 AAAA... you@laptop" -EnableRdp -ComputerName cofounder-srv
+    -EnableRdp -ComputerName cofounder-srv
 
-  Run it with no parameters first if you like: it installs everything, writes a .env template
-  with REPLACE_ME markers, refuses to start the service until they are gone, and lists what is
-  still pending at the end.
+  A bare run installs everything, writes a .env template with REPLACE_ME markers, refuses to
+  start the service until they are gone, and lists what is still pending at the end.
 
 .PARAMETER RepoUrl
   Git remote to clone. Default: the CoFounder GitHub repo.
@@ -52,7 +86,8 @@
 .PARAMETER TailscaleAuthKey
   A tailscale.com auth key so `tailscale up` needs no browser. Optional.
 .PARAMETER SshPublicKey
-  Your public key, added to administrators_authorized_keys. Optional.
+  Public key authorised for administrators over SSH. Default: the key of the laptop that runs
+  Claude Code for this project, so a bare run lets that laptop in. Pass '' to authorise nothing.
 .PARAMETER HeartbeatUrl
   A healthchecks.io (or compatible) ping URL. Optional.
 .PARAMETER EnableRdp
@@ -69,6 +104,9 @@
 .PARAMETER NoStart
   Configure the service but do not start it (for example while the Fly
   machine or the laptop worker still owns the queue).
+.PARAMETER AccessOnly
+  Stop after the access, system and tailnet steps: SSH in, never sleep, on the tailnet. The
+  rest is done later over SSH from the laptop (re-run without the switch, or step by step).
 #>
 [CmdletBinding()]
 param(
@@ -80,14 +118,28 @@ param(
   [int]$NodeMajor = 22,
   [string]$ComputerName = '',
   [string]$TailscaleAuthKey = '',
-  [string]$SshPublicKey = '',
+  [string]$SshPublicKey = 'ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIKhdoS9uKKZ/4PQmOt579LeuMrCqRnszc7zftGt9gxj3 claude-code@msi-laptop',
   [string]$HeartbeatUrl = '',
   [switch]$EnableRdp,
   [switch]$InstallClaude,
   [string]$ClaudeUserDirFrom = '',
   [string]$GitHubToken = '',
-  [switch]$NoStart
+  [switch]$NoStart,
+  [switch]$AccessOnly
 )
+
+# The one-line form (iex) cannot pass parameters, so every option also reads an env var.
+if (-not $EnvFile -and $env:COFOUNDER_ENV_FILE) { $EnvFile = $env:COFOUNDER_ENV_FILE }
+if ($env:COFOUNDER_SSH_PUBLIC_KEY) { $SshPublicKey = $env:COFOUNDER_SSH_PUBLIC_KEY }
+if (-not $TailscaleAuthKey -and $env:COFOUNDER_TAILSCALE_AUTHKEY) { $TailscaleAuthKey = $env:COFOUNDER_TAILSCALE_AUTHKEY }
+if (-not $HeartbeatUrl -and $env:COFOUNDER_HEARTBEAT_URL) { $HeartbeatUrl = $env:COFOUNDER_HEARTBEAT_URL }
+if (-not $ComputerName -and $env:COFOUNDER_COMPUTER_NAME) { $ComputerName = $env:COFOUNDER_COMPUTER_NAME }
+if (-not $GitHubToken -and $env:COFOUNDER_GITHUB_TOKEN) { $GitHubToken = $env:COFOUNDER_GITHUB_TOKEN }
+if ($env:COFOUNDER_WORKER_ROLES) { $WorkerRoles = $env:COFOUNDER_WORKER_ROLES }
+if ($env:COFOUNDER_ENABLE_RDP -eq '1') { $EnableRdp = $true }
+if ($env:COFOUNDER_INSTALL_CLAUDE -eq '1') { $InstallClaude = $true }
+if ($env:COFOUNDER_NO_START -eq '1') { $NoStart = $true }
+if ($env:COFOUNDER_ACCESS_ONLY -eq '1') { $AccessOnly = $true }
 
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
@@ -231,6 +283,85 @@ function Test-EnvHasKey([string]$Path, [string]$Key) {
   return (@(Get-Content -LiteralPath $Path -Encoding UTF8 | Where-Object { $_ -match $pattern }).Count -gt 0)
 }
 
+# Tailscale's own view of this node: @{ State; DnsName; Ip4 }, empty strings when not joined.
+function Get-TailnetSelf {
+  $ts = Join-Path $env:ProgramFiles 'Tailscale\tailscale.exe'
+  $self = @{ State = ''; DnsName = ''; Ip4 = '' }
+  if (-not (Test-Path $ts)) { return $self }
+  try {
+    $st = (Invoke-Capture $ts @('status', '--json')).Output | ConvertFrom-Json
+    $self.State = [string]$st.BackendState
+    if ($st.Self) {
+      $self.DnsName = ([string]$st.Self.DNSName).TrimEnd('.')
+      $self.Ip4 = [string]($st.Self.TailscaleIPs | Where-Object { $_ -match '^\d+\.' } | Select-Object -First 1)
+    }
+  } catch { }
+  return $self
+}
+
+# The tailnet step is a function because it runs in two places: after the service in the full
+# run, and right after the system step in the access-only run.
+function Invoke-TailnetStep {
+  Invoke-Step 'Access: Tailscale' {
+    Install-WingetPackage 'Tailscale.Tailscale' 'Tailscale'
+    $ts = Join-Path $env:ProgramFiles 'Tailscale\tailscale.exe'
+    if (-not (Test-Path $ts)) { throw "tailscale.exe not found at $ts" }
+    $hn = $env:COMPUTERNAME.ToLower()
+    if ($ComputerName) { $hn = $ComputerName.ToLower() }
+    $self = Get-TailnetSelf
+    if ($self.State -eq 'Running') { Skip "already on the tailnet as $($self.DnsName)" }
+    elseif ($TailscaleAuthKey) {
+      Invoke-Native $ts @('up', "--auth-key=$TailscaleAuthKey", "--hostname=$hn", '--accept-dns=true', '--timeout=5m')
+      Done 'joined the tailnet with the auth key'
+    } else {
+      # No key: `tailscale up` prints a login URL and waits. Open it from ANY device signed in
+      # to the Tailscale account (this PC, your phone, the laptop); it authorises this node.
+      Write-Host '   A Tailscale login link follows. Open it on any device signed in to your Tailscale account.' -ForegroundColor Magenta
+      try {
+        Invoke-Native $ts @('up', "--hostname=$hn", '--accept-dns=true', '--timeout=10m')
+        Done 'joined the tailnet (browser login)'
+      } catch {
+        Pending 'tailnet login not completed within 10 min: run  & "C:\Program Files\Tailscale\tailscale.exe" up  and open the link (or re-run with -TailscaleAuthKey)'
+      }
+    }
+    $self = Get-TailnetSelf
+    if ($self.State -eq 'Running') {
+      Set-Service -Name Tailscale -StartupType Automatic -ErrorAction SilentlyContinue
+      Write-Host "   tailnet name: $($self.DnsName)   ip: $($self.Ip4)"
+    }
+  }
+}
+
+function Write-Summary {
+  Write-Host "`n------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------" -ForegroundColor Cyan
+  Write-Host ' Done' -ForegroundColor Green
+  foreach ($l in $script:Report) { Write-Host "  - $l" }
+  if ($script:Pending.Count -gt 0) {
+    Write-Host "`n Still to do" -ForegroundColor Yellow
+    foreach ($l in $script:Pending) { Write-Host "  - $l" }
+  }
+  $self = Get-TailnetSelf
+  $lanIps = @((Get-NetIPAddress -AddressFamily IPv4 -ErrorAction SilentlyContinue |
+    Where-Object { $_.IPAddress -notlike '127.*' -and $_.IPAddress -notlike '169.254.*' }).IPAddress)
+  Write-Host "`n Reach it" -ForegroundColor Cyan
+  foreach ($ip in $lanIps) { Write-Host "  ssh $env:USERNAME@$ip   (same network)" }
+  if ($self.DnsName) {
+    Write-Host "  ssh $env:USERNAME@$($self.DnsName)   (from anywhere, over Tailscale; ip $($self.Ip4))"
+  } else { Write-Host "  ssh $env:USERNAME@<tailscale name>   (from anywhere, after tailscale up)" }
+  Write-Host ''
+  Write-Host ' >>> On the laptop, hand the box to Claude with these two values:' -ForegroundColor Magenta
+  Write-Host "     USER: $env:USERNAME"
+  if ($self.DnsName) { Write-Host "     NAME: $($self.DnsName)" } else { Write-Host "     NAME: <tailscale name, or the LAN ip above>" }
+  Write-Host "     i.e.  scripts\connect-cofounder-srv.ps1 -User $env:USERNAME -HostName $(if ($self.DnsName) { $self.DnsName } else { '<name>' })"
+  if (-not $AccessOnly) {
+    Write-Host ''
+    Write-Host "  Get-Service $ServiceName ; Get-Content '$WorkerLog' -Tail 50 -Wait"
+    Write-Host "  $ToolsDir\update-worker.ps1   after a push"
+    Write-Host "  Stop the Fly machine and the laptop worker once this one logs 'Processing agent run': one owner of the queue."
+  }
+  if ($script:RebootNeeded) { Write-Host "`n A reboot is needed (rename / Node install). Everything above starts on its own afterwards." -ForegroundColor Yellow }
+}
+
 $EnvTemplate = @'
 # CoFounder worker --- production env for this box. Never commit it (.gitignore covers .env).
 # Every value comes from the Vercel "api" project (Settings -> Environment Variables); it is the
@@ -287,7 +418,53 @@ Write-Host "   $($os.Caption), PowerShell $($PSVersionTable.PSVersion), user $en
 foreach ($d in @($InstallRoot, $LogDir, $ToolsDir, $TmpDir)) { New-Item -ItemType Directory -Path $d -Force | Out-Null }
 Done "layout under $InstallRoot"
 
-# ------ 1. system ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+# ------ 1. access, before anything else: from here on the laptop can drive the box over SSH ------
+
+Invoke-Step 'Access: OpenSSH Server' {
+  $cap = Get-WindowsCapability -Online | Where-Object { $_.Name -like 'OpenSSH.Server*' } | Select-Object -First 1
+  if ($cap -and $cap.State -ne 'Installed') { Add-WindowsCapability -Online -Name $cap.Name | Out-Null }
+  Set-Service -Name sshd -StartupType Automatic
+  Start-Service sshd   # no-op when already running; never Restart-Service here, a re-run over SSH would cut its own session
+  Set-RegistryValue 'HKLM:\SOFTWARE\OpenSSH' 'DefaultShell' "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe" 'String'
+  Done 'sshd running with PowerShell as the remote shell'
+
+  # The key goes in BEFORE the firewall is narrowed: sshd reads the file on every login, so no
+  # restart is needed, and a scoping failure below can never leave the box without key logins.
+  if ($SshPublicKey) {
+    $akf = Join-Path $env:ProgramData 'ssh\administrators_authorized_keys'
+    $existing = ''
+    if (Test-Path $akf) { $existing = [IO.File]::ReadAllText($akf) }
+    if ($existing -notmatch [regex]::Escape($SshPublicKey.Trim())) {
+      Write-Utf8NoBom $akf (($existing.TrimEnd() + "`n" + $SshPublicKey.Trim() + "`n").TrimStart())
+    }
+    # The well-known SIDs, not group names: on a French Windows the group is "Administrateurs".
+    Invoke-Native 'icacls' @($akf, '/inheritance:r', '/grant:r', '*S-1-5-32-544:F', '*S-1-5-18:F') | Out-Null
+    Done 'the laptop''s public key is authorised for administrators (no password needed)'
+  } else { Pending 'no SSH public key given: SSH will ask for your Windows password' }
+
+  if (-not (Get-NetFirewallRule -Name 'OpenSSH-Server-In-TCP' -ErrorAction SilentlyContinue)) {
+    New-NetFirewallRule -Name 'OpenSSH-Server-In-TCP' -DisplayName 'OpenSSH Server (sshd)' -Direction Inbound `
+      -Protocol TCP -LocalPort 22 -Action Allow -Profile Any | Out-Null
+  }
+  try {
+    Set-NetFirewallRule -Name 'OpenSSH-Server-In-TCP' -Enabled True -RemoteAddress $TailnetRanges
+    Done 'port 22 open to the local network and the tailnet only'
+  } catch {
+    Set-NetFirewallRule -Name 'OpenSSH-Server-In-TCP' -Enabled True
+    Pending "port 22 is open to any address: scoping it failed ($($_.Exception.Message))"
+  }
+
+  $lanIps = @((Get-NetIPAddress -AddressFamily IPv4 -ErrorAction SilentlyContinue |
+    Where-Object { $_.IPAddress -notlike '127.*' -and $_.IPAddress -notlike '169.254.*' }).IPAddress)
+  Write-Host ''
+  Write-Host '   >>> Give these three lines to Claude on the laptop; it takes over from here:' -ForegroundColor Magenta
+  Write-Host "   USER: $env:USERNAME"
+  Write-Host "   HOST: $env:COMPUTERNAME"
+  Write-Host "   IP:   $($lanIps -join ', ')"
+  Write-Host ''
+}
+
+# ------ 2. system ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
 
 Invoke-Step 'System: scripts, long paths, power, updates, time' {
   Set-ExecutionPolicy RemoteSigned -Scope LocalMachine -Force
@@ -335,7 +512,15 @@ Invoke-Step 'System: scripts, long paths, power, updates, time' {
   }
 }
 
-# ------ 2. tooling ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+# ------ access-only: reachable from anywhere, never asleep, and stop here ------------------------------------------------------------------------------------------------------------------------------------
+
+if ($AccessOnly) {
+  Invoke-TailnetStep
+  Write-Summary
+  return
+}
+
+# ------ 3. tooling ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
 
 Invoke-Step 'Tooling: Git, Node, corepack' {
   Install-WingetPackage 'Git.Git' 'Git for Windows'
@@ -346,7 +531,7 @@ Invoke-Step 'Tooling: Git, Node, corepack' {
   Done 'corepack enabled (pnpm version comes from package.json after the clone)'
 }
 
-# ------ 3. repo ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+# ------ 4. repo ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
 
 Invoke-Step 'Repo: GitHub auth and clone' {
   Install-WingetPackage 'GitHub.cli' 'GitHub CLI'
@@ -386,7 +571,7 @@ Invoke-Step 'Repo: GitHub auth and clone' {
   Done "$pm active via corepack"
 }
 
-# ------ 4. env ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+# ------ 5. env ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
 
 $EnvPath = Join-Path $RepoDir '.env'
 Invoke-Step 'Env: .env for the worker' {
@@ -414,11 +599,12 @@ Invoke-Step 'Env: .env for the worker' {
 
   # Only SYSTEM (the service), Administrators and you can read the secrets.
   $me = "$env:USERDOMAIN\$env:USERNAME"
-  Invoke-Native 'icacls' @($EnvPath, '/inheritance:r', '/grant:r', 'SYSTEM:F', 'Administrators:F', "${me}:F") | Out-Null
+  # Well-known SIDs (SYSTEM, Administrators) so the grant works on a French or any other Windows.
+  Invoke-Native 'icacls' @($EnvPath, '/inheritance:r', '/grant:r', '*S-1-5-18:F', '*S-1-5-32-544:F', "${me}:F") | Out-Null
   Done '.env ACL locked to SYSTEM, Administrators and you'
 }
 
-# ------ 5. defender ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+# ------ 6. defender ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
 
 Invoke-Step 'Defender: exclude the video scratch dir and node_modules' {
   try {
@@ -427,7 +613,7 @@ Invoke-Step 'Defender: exclude the video scratch dir and node_modules' {
   } catch { Skip "Defender not managing this machine ($($_.Exception.Message))" }
 }
 
-# ------ 6. build ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+# ------ 7. build ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
 
 Invoke-Step 'Build: install, prisma generate, worker bundle' {
   Invoke-Native 'pnpm' @('install', '--frozen-lockfile') $RepoDir
@@ -439,7 +625,7 @@ Invoke-Step 'Build: install, prisma generate, worker bundle' {
   Done 'apps/worker/dist/main.js built'
 }
 
-# ------ 7. service ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+# ------ 8. service ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
 
 Invoke-Step "Service: $ServiceName via NSSM" {
   $nssm = Install-Nssm
@@ -494,47 +680,9 @@ Invoke-Step "Service: $ServiceName via NSSM" {
   }
 }
 
-# ------ 8. remote access ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+# ------ 9. tailnet ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
 
-Invoke-Step 'Access: OpenSSH Server' {
-  $cap = Get-WindowsCapability -Online | Where-Object { $_.Name -like 'OpenSSH.Server*' } | Select-Object -First 1
-  if ($cap -and $cap.State -ne 'Installed') { Add-WindowsCapability -Online -Name $cap.Name | Out-Null }
-  Set-Service -Name sshd -StartupType Automatic
-  Start-Service sshd
-  Set-RegistryValue 'HKLM:\SOFTWARE\OpenSSH' 'DefaultShell' "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe" 'String'
-  if (-not (Get-NetFirewallRule -Name 'OpenSSH-Server-In-TCP' -ErrorAction SilentlyContinue)) {
-    New-NetFirewallRule -Name 'OpenSSH-Server-In-TCP' -DisplayName 'OpenSSH Server (sshd)' -Direction Inbound `
-      -Protocol TCP -LocalPort 22 -Action Allow -Profile Any | Out-Null
-  }
-  Set-NetFirewallRule -Name 'OpenSSH-Server-In-TCP' -Enabled True -RemoteAddress $TailnetRanges
-  Done 'sshd running, PowerShell as the shell, port 22 open to the tailnet and the LAN only'
-
-  if ($SshPublicKey) {
-    $akf = Join-Path $env:ProgramData 'ssh\administrators_authorized_keys'
-    $existing = ''
-    if (Test-Path $akf) { $existing = [IO.File]::ReadAllText($akf) }
-    if ($existing -notmatch [regex]::Escape($SshPublicKey.Trim())) {
-      Write-Utf8NoBom $akf (($existing.TrimEnd() + "`n" + $SshPublicKey.Trim() + "`n").TrimStart())
-    }
-    Invoke-Native 'icacls' @($akf, '/inheritance:r', '/grant:r', 'Administrators:F', 'SYSTEM:F') | Out-Null
-    Done 'your public key authorised for administrators'
-  } else { Pending 'no -SshPublicKey given: SSH will ask for your Windows password' }
-}
-
-Invoke-Step 'Access: Tailscale' {
-  Install-WingetPackage 'Tailscale.Tailscale' 'Tailscale'
-  $ts = Join-Path $env:ProgramFiles 'Tailscale\tailscale.exe'
-  if (-not (Test-Path $ts)) { throw "tailscale.exe not found at $ts" }
-  $state = ''
-  try { $state = ((Invoke-Capture $ts @('status', '--json')).Output | ConvertFrom-Json).BackendState } catch { }
-  if ($state -eq 'Running') { Skip 'already joined the tailnet' }
-  elseif ($TailscaleAuthKey) {
-    $hn = $env:COMPUTERNAME.ToLower()
-    if ($ComputerName) { $hn = $ComputerName.ToLower() }
-    Invoke-Native $ts @('up', "--auth-key=$TailscaleAuthKey", "--hostname=$hn", '--accept-dns=true')
-    Done 'joined the tailnet'
-  } else { Pending 'join the tailnet: run  & "C:\Program Files\Tailscale\tailscale.exe" up  and finish the login in the browser (or re-run with -TailscaleAuthKey)' }
-}
+Invoke-TailnetStep
 
 Invoke-Step 'Access: Remote Desktop' {
   if (-not $EnableRdp) { Skip 'not requested (-EnableRdp)'; return }
@@ -543,11 +691,15 @@ Invoke-Step 'Access: Remote Desktop' {
   Set-RegistryValue 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' 'UserAuthentication' 1
   $group = '@FirewallAPI.dll,-28752'   # "Remote Desktop", language-neutral
   Enable-NetFirewallRule -Group $group
-  Get-NetFirewallRule -Group $group | Set-NetFirewallRule -RemoteAddress $TailnetRanges
-  Done 'Remote Desktop on, reachable from the tailnet and the LAN only'
+  try {
+    Get-NetFirewallRule -Group $group | Set-NetFirewallRule -RemoteAddress $TailnetRanges
+    Done 'Remote Desktop on, reachable from the tailnet and the LAN only'
+  } catch {
+    Pending "Remote Desktop is on but open to any address: scoping it failed ($($_.Exception.Message))"
+  }
 }
 
-# ------ 9. heartbeat ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+# ------ 10. heartbeat ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
 
 Invoke-Step 'Watch: heartbeat every minute while the service runs' {
   if (-not $HeartbeatUrl) { Pending 'create a check at healthchecks.io (period 1 min, grace 5 min) and re-run with -HeartbeatUrl'; return }
@@ -568,7 +720,7 @@ if (`$svc -and `$svc.Status -eq 'Running') {
   Done 'heartbeat task registered (stops pinging the moment the service is not Running)'
 }
 
-# ------ 10. agents ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+# ------ 11. agents ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
 
 Invoke-Step 'Agents: Claude Code' {
   if (-not $InstallClaude) { Skip 'not requested (-InstallClaude): the box is driven over SSH from the laptop'; return }
@@ -592,7 +744,7 @@ Invoke-Step 'Agents: Claude Code' {
   Pending "log Claude in once:  cd $RepoDir ; claude   (the repo's .claude/ carries the skills, agents, rules and workflows)"
 }
 
-# ------ 11. tools ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+# ------ 12. tools ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
 
 Invoke-Step 'Tools: update-worker.ps1' {
   $upd = Join-Path $ToolsDir 'update-worker.ps1'
@@ -616,19 +768,4 @@ Get-Content '$WorkerLog' -Tail 20
 
 # ------ summary ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
 
-Write-Host "`n------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------" -ForegroundColor Cyan
-Write-Host ' Done' -ForegroundColor Green
-foreach ($l in $script:Report) { Write-Host "  - $l" }
-if ($script:Pending.Count -gt 0) {
-  Write-Host "`n Still to do" -ForegroundColor Yellow
-  foreach ($l in $script:Pending) { Write-Host "  - $l" }
-}
-$tsExe = Join-Path $env:ProgramFiles 'Tailscale\tailscale.exe'
-$dns = ''
-if (Test-Path $tsExe) { try { $dns = ((Invoke-Capture $tsExe @('status', '--json')).Output | ConvertFrom-Json).Self.DNSName.TrimEnd('.') } catch { } }
-Write-Host "`n Reach it" -ForegroundColor Cyan
-if ($dns) { Write-Host "  ssh $env:USERNAME@$dns" } else { Write-Host "  ssh $env:USERNAME@<tailscale name>   (after tailscale up)" }
-Write-Host "  Get-Service $ServiceName ; Get-Content '$WorkerLog' -Tail 50 -Wait"
-Write-Host "  $ToolsDir\update-worker.ps1   after a push"
-Write-Host "  Stop the Fly machine and the laptop worker once this one logs 'Processing agent run': one owner of the queue."
-if ($script:RebootNeeded) { Write-Host "`n A reboot is needed (rename / Node install). The service starts on its own afterwards." -ForegroundColor Yellow }
+Write-Summary

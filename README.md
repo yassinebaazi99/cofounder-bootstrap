@@ -1,61 +1,99 @@
 # cofounder-bootstrap
 
-One PowerShell script that turns a fresh Windows 10/11 PC into the always-on CoFounder server:
-the BullMQ worker as a Windows service, remote access over OpenSSH + Tailscale (+ Remote Desktop
-on Pro), a heartbeat, and power and update settings that keep it up. Nothing of Claude is installed
-on the box: the laptop's Claude Code session drives it over SSH. The script holds no secrets; the
-private application repo is cloned by the script after `gh auth login`.
+Turn a Windows 10/11 PC you own into the always-on CoFounder server, and drive it from the
+laptop the way you would a rented VPS: over SSH, from anywhere, with nothing of Claude installed
+on the box. Two scripts, no secrets in either:
 
-## Run it on the new PC
+| Script                         | Runs on    | Does                                                                                                                         |
+| ------------------------------ | ---------- | ---------------------------------------------------------------------------------------------------------------------------- |
+| `provision-windows-server.ps1` | the server | OpenSSH Server + the laptop's key, never sleep, Tailscale; then tooling, repo, `.env`, build, the worker as a Windows service |
+| `connect-cofounder-srv.ps1`    | the laptop | Tailscale here, a `Host cofounder-srv` block in `~/.ssh/config`, a connection test                                           |
 
-Open PowerShell **as administrator** and run:
+## 1. On the new PC, two minutes: make it reachable
 
-```powershell
-Set-ExecutionPolicy Bypass -Scope Process -Force
-irm https://raw.githubusercontent.com/yassinebaazi99/cofounder-bootstrap/main/provision-windows-server.ps1 -OutFile $env:TEMP\provision.ps1
-& $env:TEMP\provision.ps1
-```
-
-That first run installs everything, writes `C:\srv\cofounder\repo\.env` as a template with
-`REPLACE_ME` markers, and refuses to start the service until they are gone. Then either fill the
-template in, or copy the laptop's worker env file onto a USB stick and re-run with it:
+Open PowerShell **as administrator** and paste:
 
 ```powershell
-& $env:TEMP\provision.ps1 -EnvFile D:\.env.cloud -EnableRdp -ComputerName cofounder-srv `
-  -TailscaleAuthKey tskey-auth-... -HeartbeatUrl https://hc-ping.com/<uuid> `
-  -SshPublicKey "ssh-ed25519 AAAA... you@laptop"
+$env:COFOUNDER_ACCESS_ONLY = '1'
+[Net.ServicePointManager]::SecurityProtocol = 'Tls12'
+iex (irm https://raw.githubusercontent.com/yassinebaazi99/cofounder-bootstrap/main/provision-windows-server.ps1)
 ```
 
-Every parameter is optional and every step is idempotent. Re-run after a reboot or after
-changing anything. `Get-Help .\provision-windows-server.ps1 -Full` lists the parameters.
+That installs OpenSSH Server with PowerShell as the remote shell, authorises the laptop's public
+key, opens port 22 to the local network and the tailnet only, turns off sleep, hibernate and fast
+startup, installs Tailscale and runs `tailscale up`. A login link is printed: open it on any
+device signed in to your Tailscale account. The script ends with two lines:
 
-To pin a reviewed version instead of `main`, replace `main` in the URL with a commit SHA.
+```
+USER: <windows username>
+NAME: <name>.<tailnet>.ts.net
+```
+
+Give those two values to Claude on the laptop, or run step 2 yourself.
+
+Options for the one-line form are environment variables set before the `iex`:
+`COFOUNDER_COMPUTER_NAME=cofounder-srv` (rename, needs a reboot), `COFOUNDER_TAILSCALE_AUTHKEY`
+(no browser login), `COFOUNDER_SSH_PUBLIC_KEY` (another laptop's key), `COFOUNDER_ENABLE_RDP=1`
+(Pro only). `Get-Help .\provision-windows-server.ps1 -Full` lists everything.
+
+## 2. On the laptop: connect
+
+```powershell
+.\connect-cofounder-srv.ps1 -User <USER> -HostName <NAME>
+```
+
+Installs Tailscale on the laptop if it is missing (one UAC prompt), joins the same tailnet
+(browser login), writes the `Host cofounder-srv` block into `~/.ssh/config`, and proves the
+connection by reading the server's hostname, user, Windows edition and sshd state over SSH.
+Same Wi-Fi only, no Tailscale: `-HostName <LAN ip> -SkipTailscale`.
+
+From then on, every shell and every Claude Code session on the laptop has the box one command
+away, and the remote shell is PowerShell:
+
+```powershell
+ssh cofounder-srv "Get-Service CoFounderWorker"
+ssh cofounder-srv "Get-Content C:\srv\cofounder\logs\worker.log -Tail 50"
+ssh cofounder-srv                       # interactive PowerShell on the server
+scp .\file cofounder-srv:C:\srv\cofounder\
+```
+
+## 3. From the laptop: install the worker
+
+The rest of the provisioning runs over that SSH connection, so nothing more is typed at the PC.
+Copy the worker env file over (it is the same list `docs/deploy-fly.md` step 2 sets on Fly; the
+session pooler `:5432` URL, not the API's `:6543` one), then run the full script remotely:
+
+```powershell
+scp C:\path\to\.env.cloud cofounder-srv:C:\srv\cofounder\.env.cloud
+ssh cofounder-srv "`$env:COFOUNDER_ENV_FILE='C:\srv\cofounder\.env.cloud'; [Net.ServicePointManager]::SecurityProtocol='Tls12'; iex (irm https://raw.githubusercontent.com/yassinebaazi99/cofounder-bootstrap/main/provision-windows-server.ps1)"
+```
+
+The private application repo needs a GitHub login on the box. Over SSH there is no browser, so
+either run `gh auth login --web` once at the PC, or set `COFOUNDER_GITHUB_TOKEN` on that line to a
+fine-grained token with read access to the repo (it lands in the remote shell's history; prefer
+the one-time web login).
+
+Every step is idempotent: run the script again after a reboot, after changing `.env`, or with
+different options. It refuses to start the service while `.env` still has `REPLACE_ME` markers.
 
 ## After it runs
 
-1. Join the tailnet if you did not pass an auth key: `& "C:\Program Files\Tailscale\tailscale.exe" up`
-2. Watch the worker: `Get-Content C:\srv\cofounder\logs\worker.log -Tail 50 -Wait`
-   The proof is `Processing agent run` followed by `Agent run finished`, not `Worker ready`.
-3. Then stop the Fly machine and the laptop worker. One owner of the agent queue.
+1. Watch the worker: `ssh cofounder-srv "Get-Content C:\srv\cofounder\logs\worker.log -Tail 50 -Wait"`
+   The proof is `Processing agent run` followed by `Agent run answered`, not `Worker ready`.
+2. Then stop the Fly machine and the laptop worker. One owner of the agent queue.
+3. After a push to `main`: `ssh cofounder-srv "C:\srv\cofounder\tools\update-worker.ps1"`
+   (pull fast-forward, rebuild, restart the service, show the log tail).
 
-## Let the laptop's Claude session drive it over SSH
+## What is on the box
 
-Pass the laptop's public key as `-SshPublicKey` when you run the script; it lands in
-`administrators_authorized_keys`. The script prints the exact `ssh <user>@<host>` line at the
-end. Paste that line to Claude on the laptop.
+- The BullMQ worker (`WORKER_ROLES=media,agent`, never `scoreboard` while the Vercel cron drives
+  the tick) as the `CoFounderWorker` Windows service via NSSM: starts at boot with nobody logged
+  in, restarts on crash, 300 s graceful stop, rotating logs under `C:\srv\cofounder\logs`.
+- OpenSSH Server, PowerShell as the shell, key-only login for administrators, port 22 scoped to
+  the tailnet and the local subnet. Tailscale for reachability from anywhere. Remote Desktop only
+  with `-EnableRdp` on Windows Pro.
+- Sleep, hibernate, fast startup and NIC power saving off; Windows Update pinned to Sunday 04:00
+  (Pro; Home only honours active hours); time sync on.
+- No Claude Code, unless you pass `-InstallClaude`. The laptop's session is the operator.
 
-- Same Wi-Fi / LAN: works at once, port 22 is open to the local subnet.
-- From anywhere else: install Tailscale on the laptop too (`winget install Tailscale.Tailscale`),
-  log both machines into the same tailnet, and the same `ssh` line works over the tailnet name.
-
-The remote shell is PowerShell, so Claude runs `Get-Service`, `Get-Content -Tail`, the update
-script and anything else the way it would locally. Remote Desktop (Pro only, `-EnableRdp`) is
-there for you, not for Claude. Claude Code goes on the box only if you pass `-InstallClaude`.
-
-## Update after a push to main
-
-```powershell
-C:\srv\cofounder\tools\update-worker.ps1
-```
-
-Pulls fast-forward, rebuilds the worker, restarts the service, shows the log tail.
+To pin a reviewed version instead of `main`, replace `main` in the URL with a commit SHA.

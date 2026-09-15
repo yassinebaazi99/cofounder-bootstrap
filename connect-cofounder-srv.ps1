@@ -162,10 +162,13 @@ foreach ($b in $blocks) {
   foreach ($l in $b) { $kept.Add($l) }
 }
 while ($kept.Count -gt 0 -and [string]::IsNullOrWhiteSpace($kept[$kept.Count - 1])) { $kept.RemoveAt($kept.Count - 1) }
+# ssh_config splits arguments on whitespace; a value with a space (a Windows user like
+# "ahla media") must be double-quoted or ssh reports garbage at the end of the line.
+function Format-SshValue([string]$Value) { if ($Value -match '\s') { '"' + $Value + '"' } else { $Value } }
 $block = @(
   "Host $Alias",
-  "  HostName $HostName",
-  "  User $User",
+  "  HostName $(Format-SshValue $HostName)",
+  "  User $(Format-SshValue $User)",
   "  IdentityFile ~/.ssh/id_ed25519",
   "  IdentitiesOnly yes",
   "  ServerAliveInterval 30",

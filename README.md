@@ -99,3 +99,9 @@ different options. It refuses to start the service while `.env` still has `REPLA
 - No Claude Code, unless you pass `-InstallClaude`. The laptop's session is the operator.
 
 To pin a reviewed version instead of `main`, replace `main` in the URL with a commit SHA.
+
+## The self-hosting platform on the same box
+
+After the worker is live, `pci3-apps/` turns the desktop into a small server: a Hyper-V Ubuntu VM with
+Docker Compose, its own tailnet node, nightly restic backups and a monthly whole-VM export. Runbook, host
+scripts, guest scripts and the cloud-init seed are all in [pci3-apps/README.md](pci3-apps/README.md).

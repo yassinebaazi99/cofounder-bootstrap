@@ -1,0 +1,31 @@
+#cloud-config
+hostname: apps
+manage_etc_hosts: true
+users:
+  - name: ops
+    gecos: apps operator
+    groups: [sudo]
+    shell: /bin/bash
+    sudo: ALL=(ALL) NOPASSWD:ALL
+    lock_passwd: true
+    ssh_authorized_keys:
+      - ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIKhdoS9uKKZ/4PQmOt579LeuMrCqRnszc7zftGt9gxj3 claude-code@msi-laptop
+ssh_pwauth: false
+disable_root: true
+package_update: false
+package_upgrade: false
+timezone: Etc/UTC
+growpart:
+  mode: auto
+  devices: ['/']
+resize_rootfs: true
+swap:
+  filename: /swapfile
+  size: 2G
+  maxsize: 2G
+write_files:
+  - path: /etc/sysctl.d/90-apps.conf
+    content: |
+      vm.swappiness=10
+      vm.overcommit_memory=1
+final_message: "apps: cloud-init finished after $UPTIME s"

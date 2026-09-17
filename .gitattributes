@@ -1,0 +1,10 @@
+# Files that run inside the Linux VM must keep LF even on a Windows clone with autocrlf=true.
+* text=auto
+*.ps1 text eol=crlf
+*.sh text eol=lf
+*.service text eol=lf
+*.timer text eol=lf
+*.json text eol=lf
+*.yml text eol=lf
+pci3-apps/seed/cidata/* text eol=lf
+pci3-apps/stacks/gitignore text eol=lf

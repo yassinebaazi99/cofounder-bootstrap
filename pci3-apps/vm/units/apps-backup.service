@@ -1,0 +1,8 @@
+[Unit]
+Description=apps nightly restic backup
+[Service]
+Environment=RESTIC_CACHE_DIR=/var/cache/restic
+Type=oneshot
+ExecStart=/usr/local/bin/apps-backup.sh
+Nice=15
+IOSchedulingClass=idle

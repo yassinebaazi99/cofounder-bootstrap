@@ -1,0 +1,5 @@
+[Unit]
+Description=apps platform-alive ping (healthchecks.io)
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/apps-alive
